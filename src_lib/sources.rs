@@ -31,6 +31,7 @@ use core_foundation::{
     CFMutableArrayRef, kCFTypeArrayCallBacks,
   },
   base::{CFAllocatorRef, CFRange, CFRelease, CFTypeRef, kCFAllocatorDefault, kCFAllocatorNull},
+  boolean::kCFBooleanTrue,
   data::{CFDataGetBytes, CFDataGetLength, CFDataRef},
   dictionary::{
     CFDictionaryCreate, CFDictionaryCreateMutableCopy, CFDictionaryGetCount,
@@ -50,6 +51,21 @@ pub type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 pub type CVoidRef = *const std::ffi::c_void;
 
 static SOC_INFO_CACHE: OnceLock<SocInfo> = OnceLock::new();
+
+/// Current battery and external-power status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryStatus {
+  /// Remaining charge as a percentage.
+  pub capacity: u8,
+  /// Whether the battery is actively charging.
+  pub is_charging: bool,
+  /// Whether the system is connected to external power.
+  pub on_ac_power: bool,
+  /// Rated adapter wattage, when reported by macOS.
+  pub adapter_watts: Option<u32>,
+  /// Live DC input power in milliwatts, when reported by macOS.
+  pub input_power_mw: Option<u32>,
+}
 
 // MARK: CFUtils
 
@@ -129,6 +145,8 @@ unsafe extern "C" {
   fn IORegistryEntryGetName(entry: u32, name: *mut i8) -> i32;
   fn IORegistryEntryCreateCFProperties(entry: u32, properties: *mut CFMutableDictionaryRef, allocator: CFAllocatorRef, options: u32) -> i32;
   fn IOObjectRelease(obj: u32) -> u32;
+  fn IOPSCopyPowerSourcesInfo() -> CFTypeRef;
+  fn IOPSGetProvidingPowerSourceType(snapshot: CFTypeRef) -> CFStringRef;
 }
 
 #[repr(C)]
@@ -632,6 +650,49 @@ fn cfnum_get_i64(dict: CFDictionaryRef, key: &str) -> Option<i64> {
   let mut val: i64 = 0;
   let ok = unsafe { CFNumberGetValue(obj, kCFNumberSInt64Type, &mut val as *mut _ as *mut c_void) };
   ok.then_some(val)
+}
+
+fn battery_percentage(current: i64, max: i64) -> Option<u8> {
+  (current >= 0 && max > 0).then(|| (current.saturating_mul(100) / max).clamp(0, 100) as u8)
+}
+
+fn is_ac_power() -> bool {
+  let snapshot = unsafe { IOPSCopyPowerSourcesInfo() };
+  if snapshot.is_null() {
+    return false;
+  }
+  let source = unsafe { IOPSGetProvidingPowerSourceType(snapshot) };
+  let is_ac = !source.is_null() && from_cfstr(source) == "AC Power";
+  unsafe { CFRelease(snapshot) }
+  is_ac
+}
+
+/// Read the built-in battery status from the macOS IORegistry.
+pub fn get_battery_status() -> Option<BatteryStatus> {
+  let (entry, name) = IOServiceIterator::new("AppleSmartBattery").ok()?.next()?;
+  let props = cfio_get_props(entry, name).ok()?;
+  let capacity = cfnum_get_i64(props, "CurrentCapacity").and_then(|current| {
+    cfnum_get_i64(props, "MaxCapacity").and_then(|max| battery_percentage(current, max))
+  });
+  let is_charging = cfdict_get_val(props, "IsCharging")
+    .is_some_and(|value| value == unsafe { kCFBooleanTrue } as CFTypeRef);
+  let adapter_watts = cfdict_get_val(props, "AdapterDetails")
+    .and_then(|details| cfnum_get_i64(details.cast(), "Watts"))
+    .and_then(|watts| u32::try_from(watts).ok())
+    .filter(|watts| *watts > 0);
+  let input_power_mw = cfdict_get_val(props, "PowerTelemetryData")
+    .and_then(|telemetry| cfnum_get_i64(telemetry.cast(), "SystemPowerIn"))
+    .and_then(|milliwatts| u32::try_from(milliwatts).ok())
+    .filter(|milliwatts| *milliwatts > 0);
+  let on_ac_power = is_ac_power();
+  unsafe { CFRelease(props as _) }
+  capacity.map(|capacity| BatteryStatus {
+    capacity,
+    is_charging,
+    on_ac_power,
+    adapter_watts,
+    input_power_mw,
+  })
 }
 
 // perflevel0 is Apple's highest-capability CPU cluster, the last perflevel is the
@@ -1427,5 +1488,13 @@ mod tests {
 
     assert!(cfio_channel_matches(&[], "CPU Stats", "CPU Core Performance States"));
     assert!(cfio_channel_matches(&[], "Energy Model", ""));
+  }
+
+  #[test]
+  fn calculates_battery_percentage() {
+    assert_eq!(battery_percentage(79, 100), Some(79));
+    assert_eq!(battery_percentage(9_000, 10_000), Some(90));
+    assert_eq!(battery_percentage(110, 100), Some(100));
+    assert_eq!(battery_percentage(1, 0), None);
   }
 }

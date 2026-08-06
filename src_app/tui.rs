@@ -13,7 +13,10 @@ use ratatui::crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use crate::config::{Config, RatioMode, TUI_MAX_MS, TUI_MIN_MS, ViewType};
-use macmon::{CpuCoreMetrics, FanMetric, MemMetrics, Metrics, Sampler, SocInfo};
+use macmon::{
+  CpuCoreMetrics, FanMetric, MemMetrics, Metrics, Sampler, SocInfo,
+  sources::{BatteryStatus, get_battery_status},
+};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -276,7 +279,7 @@ fn h_stack(area: Rect) -> (Rect, Rect) {
 // MARK: Threads
 
 enum Event {
-  Update(Box<Metrics>),
+  Update(Box<Metrics>, Option<BatteryStatus>),
   ChangeColor,
   ChangeView,
   TogglePerCore,
@@ -329,11 +332,13 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
     let mut sampler = Sampler::new().unwrap();
 
     // Send initial metrics
-    tx.send(Event::Update(Box::new(sampler.get_metrics(100).unwrap()))).unwrap();
+    tx.send(Event::Update(Box::new(sampler.get_metrics(100).unwrap()), get_battery_status()))
+      .unwrap();
 
     loop {
       let msec = (*msec.read().unwrap()).max(TUI_MIN_MS);
-      tx.send(Event::Update(Box::new(sampler.get_metrics(msec).unwrap()))).unwrap();
+      tx.send(Event::Update(Box::new(sampler.get_metrics(msec).unwrap()), get_battery_status()))
+        .unwrap();
     }
   });
 }
@@ -346,6 +351,66 @@ fn avg2<T: num_traits::Float>(a: T, b: T) -> T {
 
 fn ratio(value: f64, total: f64) -> f64 {
   if total == 0.0 { 0.0 } else { value / total }
+}
+
+fn battery_bar(capacity: u8) -> String {
+  let set = symbols::block::NINE_LEVELS;
+  let levels = [
+    set.empty,
+    set.one_eighth,
+    set.one_quarter,
+    set.three_eighths,
+    set.half,
+    set.five_eighths,
+    set.three_quarters,
+    set.seven_eighths,
+  ];
+  let eighths = usize::from(capacity.min(100)) * 32 / 100;
+  let full = eighths / 8;
+  let partial = eighths % 8;
+
+  format!(
+    "▕{}{}{}{}",
+    set.full.repeat(full),
+    if full < 4 { levels[partial] } else { "" },
+    set.empty.repeat(4usize.saturating_sub(full + usize::from(full < 4))),
+    if capacity < 100 { "▏" } else { "" }
+  )
+}
+
+fn battery_color(status: BatteryStatus, primary: Color) -> Color {
+  if status.on_ac_power && status.is_charging {
+    return Color::Green;
+  }
+  match status.capacity {
+    0..=25 => Color::Red,
+    26..50 => Color::Yellow,
+    _ => primary,
+  }
+}
+
+fn battery_label(status: BatteryStatus, primary: Color) -> Line<'static> {
+  let color = battery_color(status, primary);
+  let mut spans = vec![Span::styled(format!(" {}", battery_bar(status.capacity)), color)];
+  if status.capacity <= 15 || status.capacity < 100 && status.is_charging {
+    spans.push(Span::styled(format!(" {}%", status.capacity), primary));
+  }
+  if status.is_charging || status.on_ac_power && status.input_power_mw.is_some() {
+    spans.push(Span::styled(" ⚡", color));
+  }
+  spans.push(Span::raw(" "));
+  Line::from(spans)
+}
+
+fn power_label(status: Option<BatteryStatus>) -> String {
+  let Some(status) = status.filter(|status| status.on_ac_power) else { return String::new() };
+  let input_watts = status.input_power_mw.map(|milliwatts| milliwatts as f64 / 1000.0);
+  match (input_watts, status.adapter_watts) {
+    (Some(input), Some(max)) => format!("AC {input:.0}/{max}W"),
+    (Some(input), None) => format!("AC {input:.0}W"),
+    (None, Some(max)) => format!("AC {max}W"),
+    (None, None) => "AC connected".to_string(),
+  }
 }
 
 // MARK: App
@@ -366,6 +431,7 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
   fans: FanStore,
+  battery: Option<BatteryStatus>,
 
   ecpu_freq: CpuFreqStore,
   pcpu_freq: CpuFreqStore,
@@ -745,14 +811,16 @@ impl App {
     } else {
       None
     };
-    let label_r = match (!fan_label.is_empty(), sys_label) {
-      (true, Some(sys_label)) => format!("{fan_label} | {sys_label}"),
-      (true, None) => fan_label,
-      (false, Some(sys_label)) => sys_label,
-      (false, None) => "".to_string(),
-    };
+    let label_r = [power_label(self.battery), fan_label, sys_label.unwrap_or_default()]
+      .into_iter()
+      .filter(|label| !label.is_empty())
+      .collect::<Vec<_>>()
+      .join(" | ");
 
-    let block = self.title_block(&label_l, &label_r);
+    let mut block = self.title_block(&label_l, &label_r);
+    if let Some(battery) = self.battery {
+      block = block.title_bottom(battery_label(battery, self.cfg.color));
+    }
     let usage = format!(
       " q quit | c color | v chart | d detail | r {} | -/+ {}ms ",
       self.cfg.ratio_mode.label(),
@@ -788,7 +856,10 @@ impl App {
 
       match rx.recv()? {
         Event::Quit => break,
-        Event::Update(data) => self.update_metrics(*data),
+        Event::Update(data, battery) => {
+          self.update_metrics(*data);
+          self.battery = battery;
+        }
         Event::ChangeColor => self.cfg.next_color(),
         Event::ChangeView => self.cfg.next_view_type(),
         Event::TogglePerCore => self.cfg.toggle_per_core_view(),
@@ -807,5 +878,69 @@ impl App {
 
     leave_term();
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{battery_bar, battery_color, battery_label, power_label};
+  use macmon::sources::BatteryStatus;
+  use ratatui::{style::Color, text::Line};
+
+  fn battery(capacity: u8, is_charging: bool, on_ac_power: bool) -> BatteryStatus {
+    BatteryStatus { capacity, is_charging, on_ac_power, adapter_watts: None, input_power_mw: None }
+  }
+
+  #[test]
+  fn renders_battery_levels_and_colors() {
+    for (capacity, expected) in [
+      (0, "▕    ▏"),
+      (1, "▕    ▏"),
+      (15, "▕▌   ▏"),
+      (25, "▕█   ▏"),
+      (50, "▕██  ▏"),
+      (75, "▕███ ▏"),
+      (99, "▕███▉▏"),
+      (100, "▕████"),
+    ] {
+      assert_eq!(battery_bar(capacity), expected);
+    }
+
+    assert_eq!(battery_color(battery(25, false, false), Color::Blue), Color::Red);
+    assert_eq!(battery_color(battery(26, false, false), Color::Blue), Color::Yellow);
+    assert_eq!(battery_color(battery(49, false, false), Color::Blue), Color::Yellow);
+    assert_eq!(battery_color(battery(50, false, false), Color::Blue), Color::Blue);
+    assert_eq!(battery_color(battery(10, true, true), Color::Blue), Color::Green);
+
+    let base = battery(79, false, false);
+    let text =
+      |line: Line<'_>| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+    assert_eq!(text(battery_label(base, Color::Green)), " ▕███▏▏ ");
+    let charging = battery_label(battery(79, true, true), Color::Blue);
+    assert_eq!(text(charging.clone()), " ▕███▏▏ 79% ⚡ ");
+    assert_eq!(charging.spans[0].style.fg, Some(Color::Green));
+    assert_eq!(charging.spans[1].style.fg, Some(Color::Blue));
+    assert_eq!(charging.spans[2].style.fg, Some(Color::Green));
+
+    let low = battery_label(battery(15, true, false), Color::Green);
+    assert_eq!(text(low.clone()), " ▕▌   ▏ 15% ⚡ ");
+    assert_eq!(low.spans[0].style.fg, Some(Color::Red));
+    assert_eq!(low.spans[1].style.fg, Some(Color::Green));
+    assert_eq!(text(battery_label(battery(16, false, false), Color::Green)), " ▕▋   ▏ ");
+
+    let mut powered = battery(15, false, true);
+    powered.input_power_mw = Some(10_000);
+    assert_eq!(text(battery_label(powered, Color::Green)), " ▕▌   ▏ 15% ⚡ ");
+    assert_eq!(text(battery_label(battery(100, true, true), Color::Blue)), " ▕████ ⚡ ");
+
+    let mut adapter = battery(50, true, true);
+    assert_eq!(power_label(Some(adapter)), "AC connected");
+    adapter.adapter_watts = Some(65);
+    assert_eq!(power_label(Some(adapter)), "AC 65W");
+    adapter.input_power_mw = Some(46_355);
+    assert_eq!(power_label(Some(adapter)), "AC 46/65W");
+    adapter.adapter_watts = None;
+    assert_eq!(power_label(Some(adapter)), "AC 46W");
+    assert_eq!(power_label(Some(battery(50, false, false))), "");
   }
 }
