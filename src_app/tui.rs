@@ -424,7 +424,6 @@ pub struct App {
 
   cpu_power: PowerStore,
   gpu_power: PowerStore,
-  ane_power: PowerStore,
   all_power: PowerStore,
   sys_power: PowerStore,
 
@@ -448,7 +447,6 @@ impl App {
   fn update_metrics(&mut self, data: Metrics) {
     self.cpu_power.push(data.cpu_power as f64);
     self.gpu_power.push(data.gpu_power as f64);
-    self.ane_power.push(data.ane_power as f64);
     self.all_power.push(data.all_power as f64);
     self.sys_power.push(data.sys_power as f64);
 
@@ -801,17 +799,7 @@ impl App {
       self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
     );
 
-    // Show labels only if sensors are available
-    let fan_label = self.fans.label();
-    let sys_label = if self.sys_power.top_value > 0.0 {
-      Some(format!(
-        "Total {:.2}W ({:.2}, {:.2})",
-        self.sys_power.top_value, self.sys_power.avg_value, self.sys_power.max_value
-      ))
-    } else {
-      None
-    };
-    let label_r = [power_label(self.battery), fan_label, sys_label.unwrap_or_default()]
+    let label_r = [power_label(self.battery), self.fans.label()]
       .into_iter()
       .filter(|label| !label.is_empty())
       .collect::<Vec<_>>()
@@ -837,7 +825,7 @@ impl App {
 
     f.render_widget(self.get_power_block("CPU", &self.cpu_power, self.cpu_temp.last()), ha[0]);
     f.render_widget(self.get_power_block("GPU", &self.gpu_power, self.gpu_temp.last()), ha[1]);
-    f.render_widget(self.get_power_block("ANE", &self.ane_power, 0.0), ha[2]);
+    f.render_widget(self.get_power_block("Total", &self.sys_power, 0.0), ha[2]);
   }
 
   pub fn run_loop(&mut self, interval: Option<u32>) -> WithError<()> {
