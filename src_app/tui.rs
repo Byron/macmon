@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
-use std::{io::stdout, time::Instant};
+use std::{io::stdout, process::Command, time::Instant};
 use std::{sync::mpsc, time::Duration};
 
 use ratatui::crossterm::{
@@ -24,6 +24,7 @@ const GB: u64 = 1024 * 1024 * 1024;
 const MAX_SPARKLINE: usize = 128;
 const MAX_TEMPS: usize = 8;
 const BATTERY_LOADS_W: [u64; 3] = [20, 50, 99];
+const EFFECTIVE_FULL_HOLD: Duration = Duration::from_secs(5 * 60);
 
 // MARK: Term utils
 
@@ -417,13 +418,55 @@ fn battery_runtime_key(status: BatteryStatus) -> Option<(usize, Option<u8>)> {
     .then(|| (battery_steps(status.capacity), (status.capacity <= 15).then_some(status.capacity)))
 }
 
-fn format_runtime(energy_mwh: u64, watts: u64) -> String {
-  let minutes = energy_mwh.saturating_mul(60) / (watts * 1000);
+fn format_minutes(minutes: u64) -> String {
   if minutes >= 60 {
     format!("{}h{:02}m", minutes / 60, minutes % 60)
   } else {
     format!("{minutes}m")
   }
+}
+
+fn format_runtime(energy_mwh: u64, watts: u64) -> String {
+  format_minutes(energy_mwh.saturating_mul(60) / (watts * 1000))
+}
+
+fn battery_time_label(elapsed: Duration) -> String {
+  format!("On battery {}", format_minutes(elapsed.as_secs() / 60))
+}
+
+fn pmset_field<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
+  let value = entry.split_once(key)?.1.trim_start().strip_prefix('=')?.trim_start();
+  value.split(|ch: char| ch == ';' || ch == ',' || ch.is_whitespace()).next()
+}
+
+fn parse_charge_limit(output: &str) -> Option<u8> {
+  let mut manual = None;
+  let mut fallback = None;
+
+  for entry in output.split('}') {
+    if pmset_field(entry, "Terminated") != Some("0") {
+      continue;
+    }
+    let Some(limit) = pmset_field(entry, "chargeSocLimitSoc")
+      .and_then(|value| value.parse::<u8>().ok())
+      .filter(|limit| (80..=100).contains(limit))
+    else {
+      continue;
+    };
+    let target = if pmset_field(entry, "chargeSocLimitReason") == Some("manualChargeLimit") {
+      &mut manual
+    } else {
+      &mut fallback
+    };
+    *target = Some(target.map_or(limit, |current: u8| current.min(limit)));
+  }
+
+  manual.or(fallback)
+}
+
+fn configured_charge_limit() -> Option<u8> {
+  let output = Command::new("/usr/bin/pmset").args(["-g", "battlimit"]).output().ok()?;
+  output.status.success().then(|| parse_charge_limit(&String::from_utf8_lossy(&output.stdout)))?
 }
 
 fn battery_runtime(energy_mwh: u64) -> String {
@@ -447,6 +490,137 @@ fn power_label(status: Option<BatteryStatus>) -> String {
 
 // MARK: App
 
+#[derive(Debug, Clone, Copy)]
+struct ChargeSession {
+  capacity: u8,
+  elapsed: Duration,
+  target: u8,
+  learned_target: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StableHold {
+  capacity: u8,
+  elapsed: Duration,
+}
+
+#[derive(Debug, Default)]
+struct BatteryTimer {
+  elapsed: Duration,
+  sample: Option<BatteryStatus>,
+  sampled_at: Option<Instant>,
+  on_ac_power: Option<bool>,
+  charge: Option<ChargeSession>,
+  hold: Option<StableHold>,
+  learned_target: Option<u8>,
+}
+
+impl BatteryTimer {
+  fn entering_ac(&self, sample: Option<BatteryStatus>) -> bool {
+    sample.is_some_and(|status| status.on_ac_power && self.on_ac_power != Some(true))
+  }
+
+  fn elapsed_at(&self, now: Instant) -> Option<Duration> {
+    self.sample.filter(|status| !status.on_ac_power).map(|_| {
+      self.elapsed + self.sampled_at.map(|at| now.saturating_duration_since(at)).unwrap_or_default()
+    })
+  }
+
+  fn apply_charge(&mut self, status: BatteryStatus) {
+    let Some(mut charge) = self.charge else { return };
+    if charge.learned_target
+      && (status.capacity > charge.target || status.capacity == charge.target && status.is_charging)
+    {
+      charge.target = 100;
+      charge.learned_target = false;
+      self.charge = Some(charge);
+    }
+
+    let remaining = if status.capacity >= charge.target || charge.capacity >= charge.target {
+      Duration::ZERO
+    } else {
+      charge.elapsed.mul_f64(
+        f64::from(charge.target - status.capacity) / f64::from(charge.target - charge.capacity),
+      )
+    };
+    self.elapsed = self.elapsed.min(remaining);
+  }
+
+  fn update_hold(
+    &mut self,
+    status: BatteryStatus,
+    previous: Option<BatteryStatus>,
+    delta: Duration,
+  ) {
+    if !status.charging_paused || !(80..100).contains(&status.capacity) {
+      self.hold = None;
+      return;
+    }
+
+    let stable_delta = previous
+      .filter(|previous| previous.charging_paused && previous.capacity == status.capacity)
+      .map(|_| delta)
+      .unwrap_or_default();
+    match &mut self.hold {
+      Some(hold) if hold.capacity == status.capacity => hold.elapsed += stable_delta,
+      hold => *hold = Some(StableHold { capacity: status.capacity, elapsed: Duration::ZERO }),
+    }
+
+    if self.hold.is_some_and(|hold| hold.elapsed >= EFFECTIVE_FULL_HOLD) {
+      self.elapsed = Duration::ZERO;
+      self.learned_target = Some(status.capacity);
+      if let Some(charge) = &mut self.charge {
+        charge.target = status.capacity;
+        charge.learned_target = true;
+      }
+    }
+  }
+
+  fn update(&mut self, sample: Option<BatteryStatus>, now: Instant, configured_target: Option<u8>) {
+    let previous = self.sample;
+    let delta = self
+      .sampled_at
+      .map(|sampled_at| now.saturating_duration_since(sampled_at))
+      .unwrap_or_default();
+    if previous.is_some_and(|status| !status.on_ac_power) {
+      self.elapsed += delta;
+    }
+    self.sampled_at = Some(now);
+
+    let Some(status) = sample else {
+      self.sample = None;
+      return;
+    };
+
+    if self.entering_ac(sample) {
+      let (target, learned_target) =
+        match configured_target.filter(|limit| (80..=100).contains(limit)) {
+          Some(limit) => (limit, false),
+          None => self
+            .learned_target
+            .filter(|limit| status.capacity <= *limit)
+            .map_or((100, false), |limit| (limit, true)),
+        };
+      self.charge = Some(ChargeSession {
+        capacity: status.capacity,
+        elapsed: self.elapsed,
+        target,
+        learned_target,
+      });
+    }
+    self.apply_charge(status);
+
+    if status.on_ac_power {
+      self.update_hold(status, previous, delta);
+    } else {
+      self.charge = None;
+      self.hold = None;
+    }
+    self.on_ac_power = Some(status.on_ac_power);
+    self.sample = Some(status);
+  }
+}
+
 #[derive(Debug, Default)]
 pub struct App {
   cfg: Config,
@@ -463,6 +637,7 @@ pub struct App {
   gpu_temp: TempStore,
   fans: FanStore,
   battery: Option<BatteryStatus>,
+  battery_timer: BatteryTimer,
   battery_runtime_key: Option<(usize, Option<u8>)>,
   battery_runtime: String,
   show_help: bool,
@@ -501,6 +676,10 @@ impl App {
   }
 
   fn update_battery(&mut self, battery: Option<BatteryStatus>) {
+    let charge_limit =
+      self.battery_timer.entering_ac(battery).then(configured_charge_limit).flatten();
+    self.battery_timer.update(battery, Instant::now(), charge_limit);
+
     let key = battery.and_then(battery_runtime_key);
     if key != self.battery_runtime_key {
       self.battery_runtime = battery
@@ -847,11 +1026,15 @@ impl App {
       self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
     );
 
-    let label_r = [power_label(self.battery), self.fans.label()]
-      .into_iter()
-      .filter(|label| !label.is_empty())
-      .collect::<Vec<_>>()
-      .join(" | ");
+    let label_r = [
+      self.battery_timer.elapsed_at(Instant::now()).map(battery_time_label).unwrap_or_default(),
+      power_label(self.battery),
+      self.fans.label(),
+    ]
+    .into_iter()
+    .filter(|label| !label.is_empty())
+    .collect::<Vec<_>>()
+    .join(" | ");
 
     let mut block = self.title_block(&label_l, &label_r);
     if let Some(battery) = self.battery {
@@ -942,17 +1125,19 @@ impl App {
 #[cfg(test)]
 mod tests {
   use super::{
-    battery_bar, battery_color, battery_label, battery_runtime, battery_runtime_key,
-    format_runtime, power_label,
+    BatteryTimer, battery_bar, battery_color, battery_label, battery_runtime, battery_runtime_key,
+    battery_time_label, format_runtime, parse_charge_limit, power_label,
   };
   use macmon::sources::BatteryStatus;
   use ratatui::{style::Color, text::Line};
+  use std::time::Duration;
 
   fn battery(capacity: u8, is_charging: bool, on_ac_power: bool) -> BatteryStatus {
     BatteryStatus {
       capacity,
       is_charging,
       on_ac_power,
+      charging_paused: false,
       adapter_watts: None,
       input_power_mw: None,
       remaining_energy_mwh: None,
@@ -1036,5 +1221,106 @@ mod tests {
       text(battery_label(battery(79, false, false), Color::Green, "2h20m@20W")),
       " ▕███▏▏ 2h20m@20W "
     );
+  }
+
+  #[test]
+  fn scales_battery_time_across_partial_charges() {
+    assert_eq!(battery_time_label(Duration::ZERO), "On battery 0m");
+    assert_eq!(battery_time_label(Duration::from_secs(83 * 60)), "On battery 1h23m");
+
+    let start = std::time::Instant::now();
+    let mut timer = BatteryTimer::default();
+    timer.update(Some(battery(80, false, false)), start, None);
+    timer.update(Some(battery(80, false, false)), start + Duration::from_secs(60 * 60), None);
+    timer.update(Some(battery(80, true, true)), start + Duration::from_secs(60 * 60), Some(100));
+    timer.update(Some(battery(90, true, true)), start + Duration::from_secs(70 * 60), None);
+    assert_eq!(timer.elapsed, Duration::from_secs(30 * 60));
+    assert_eq!(timer.elapsed_at(start + Duration::from_secs(70 * 60)), None);
+
+    timer.update(Some(battery(90, false, false)), start + Duration::from_secs(70 * 60), None);
+    assert_eq!(
+      timer.elapsed_at(start + Duration::from_secs(85 * 60)),
+      Some(Duration::from_secs(45 * 60))
+    );
+  }
+
+  #[test]
+  fn honors_explicit_charge_targets_and_full_charge() {
+    let start = std::time::Instant::now();
+    let mut timer = BatteryTimer::default();
+    timer.update(Some(battery(80, false, false)), start, None);
+    timer.update(Some(battery(80, false, false)), start + Duration::from_secs(60 * 60), None);
+    timer.update(Some(battery(80, true, true)), start + Duration::from_secs(60 * 60), Some(90));
+    timer.update(Some(battery(85, true, true)), start + Duration::from_secs(65 * 60), None);
+    assert_eq!(timer.elapsed, Duration::from_secs(30 * 60));
+    timer.update(Some(battery(90, false, true)), start + Duration::from_secs(70 * 60), None);
+    assert_eq!(timer.elapsed, Duration::ZERO);
+
+    let mut timer = BatteryTimer { elapsed: Duration::from_secs(60 * 60), ..Default::default() };
+    timer.update(Some(battery(95, true, true)), start, Some(100));
+    timer.update(Some(battery(100, false, true)), start + Duration::from_secs(5 * 60), None);
+    assert_eq!(timer.elapsed, Duration::ZERO);
+  }
+
+  #[test]
+  fn learns_only_stable_effective_full_holds() {
+    let start = std::time::Instant::now();
+    let mut timer = BatteryTimer { elapsed: Duration::from_secs(60 * 60), ..Default::default() };
+    let mut paused = battery(80, false, true);
+    paused.charging_paused = true;
+
+    timer.update(Some(paused), start, None);
+    timer.update(Some(paused), start + Duration::from_secs(4 * 60 + 59), None);
+    assert_eq!(timer.elapsed, Duration::from_secs(60 * 60));
+    timer.update(Some(battery(80, true, true)), start + Duration::from_secs(5 * 60), None);
+    assert_eq!(timer.learned_target, None);
+
+    timer.update(Some(paused), start + Duration::from_secs(6 * 60), None);
+    timer.update(Some(paused), start + Duration::from_secs(11 * 60), None);
+    assert_eq!(timer.learned_target, Some(80));
+    assert_eq!(timer.elapsed, Duration::ZERO);
+  }
+
+  #[test]
+  fn charging_past_a_learned_target_uses_full_capacity() {
+    let start = std::time::Instant::now();
+    let mut timer = BatteryTimer {
+      elapsed: Duration::from_secs(60 * 60),
+      learned_target: Some(80),
+      ..Default::default()
+    };
+    timer.update(Some(battery(80, true, true)), start, None);
+    assert_eq!(timer.elapsed, Duration::from_secs(60 * 60));
+    assert_eq!(timer.charge.unwrap().target, 100);
+  }
+
+  #[test]
+  fn missing_battery_samples_freeze_and_hide_time() {
+    let start = std::time::Instant::now();
+    let mut timer = BatteryTimer::default();
+    timer.update(Some(battery(70, false, false)), start, None);
+    timer.update(None, start + Duration::from_secs(10 * 60), None);
+    assert_eq!(timer.elapsed_at(start + Duration::from_secs(40 * 60)), None);
+
+    timer.update(Some(battery(69, false, false)), start + Duration::from_secs(40 * 60), None);
+    assert_eq!(
+      timer.elapsed_at(start + Duration::from_secs(45 * 60)),
+      Some(Duration::from_secs(15 * 60))
+    );
+  }
+
+  #[test]
+  fn parses_active_pmset_charge_limits() {
+    let limits = r#"Battery level limits:
+      ( { chargeSocLimitReason = optimizedCharging; chargeSocLimitSoc = 85; Terminated = 0; },
+        { chargeSocLimitReason = manualChargeLimit; chargeSocLimitSoc = 90; Terminated = 0; },
+        { chargeSocLimitReason = manualChargeLimit; chargeSocLimitSoc = 80; Terminated = 1; } )"#;
+    assert_eq!(parse_charge_limit(limits), Some(90));
+
+    let fallback = r#"( { chargeSocLimitSoc = 95; Terminated = 0; },
+      { chargeSocLimitSoc = 85; Terminated = 0; },
+      { chargeSocLimitSoc = 70; Terminated = 0; } )"#;
+    assert_eq!(parse_charge_limit(fallback), Some(85));
+    assert_eq!(parse_charge_limit("No battery level limits set"), None);
   }
 }

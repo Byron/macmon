@@ -61,6 +61,8 @@ pub struct BatteryStatus {
   pub is_charging: bool,
   /// Whether the system is connected to external power.
   pub on_ac_power: bool,
+  /// Whether macOS has deliberately paused charging while on external power.
+  pub charging_paused: bool,
   /// Rated adapter wattage, when reported by macOS.
   pub adapter_watts: Option<u32>,
   /// Live DC input power in milliwatts, when reported by macOS.
@@ -664,6 +666,10 @@ fn battery_energy_mwh(capacity_mah: i64, voltage_mv: i64) -> Option<u64> {
   (capacity_mah > 0 && voltage_mv > 0).then(|| capacity_mah.saturating_mul(voltage_mv) / 1000)
 }
 
+fn battery_charging_paused(on_ac_power: bool, is_charging: bool, reason: i64) -> bool {
+  on_ac_power && !is_charging && reason != 0
+}
+
 fn is_ac_power() -> bool {
   let snapshot = unsafe { IOPSCopyPowerSourcesInfo() };
   if snapshot.is_null() {
@@ -698,11 +704,15 @@ pub fn get_battery_status() -> Option<BatteryStatus> {
       .and_then(|voltage| battery_energy_mwh(capacity, voltage))
   });
   let on_ac_power = is_ac_power();
+  let not_charging_reason = cfdict_get_val(props, "ChargerData")
+    .and_then(|data| cfnum_get_i64(data.cast(), "NotChargingReason"))
+    .unwrap_or_default();
   unsafe { CFRelease(props as _) }
   capacity.map(|capacity| BatteryStatus {
     capacity,
     is_charging,
     on_ac_power,
+    charging_paused: battery_charging_paused(on_ac_power, is_charging, not_charging_reason),
     adapter_watts,
     input_power_mw,
     remaining_energy_mwh,
@@ -1517,5 +1527,13 @@ mod tests {
     assert_eq!(battery_energy_mwh(7307, 12920), Some(94_406));
     assert_eq!(battery_energy_mwh(0, 12920), None);
     assert_eq!(battery_energy_mwh(-1, 12920), None);
+  }
+
+  #[test]
+  fn identifies_an_intentional_charging_pause_only_on_ac_power() {
+    assert!(battery_charging_paused(true, false, 1));
+    assert!(!battery_charging_paused(true, true, 1));
+    assert!(!battery_charging_paused(false, false, 1));
+    assert!(!battery_charging_paused(true, false, 0));
   }
 }
