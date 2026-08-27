@@ -23,6 +23,7 @@ type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 const GB: u64 = 1024 * 1024 * 1024;
 const MAX_SPARKLINE: usize = 128;
 const MAX_TEMPS: usize = 8;
+const BATTERY_LOADS_W: [u64; 3] = [20, 50, 99];
 
 // MARK: Term utils
 
@@ -284,6 +285,7 @@ enum Event {
   ChangeView,
   TogglePerCore,
   ToggleRatioMode,
+  ToggleHelp,
   IncInterval,
   DecInterval,
   Tick,
@@ -298,6 +300,7 @@ fn handle_key_event(key: &event::KeyEvent, tx: &mpsc::Sender<Event>) -> WithErro
     KeyCode::Char('v') => Ok(tx.send(Event::ChangeView)?),
     KeyCode::Char('d') => Ok(tx.send(Event::TogglePerCore)?),
     KeyCode::Char('r') => Ok(tx.send(Event::ToggleRatioMode)?),
+    KeyCode::Char('?') => Ok(tx.send(Event::ToggleHelp)?),
     KeyCode::Char('+') => Ok(tx.send(Event::IncInterval)?),
     KeyCode::Char('=') => Ok(tx.send(Event::IncInterval)?), // fallback to press without shift
     KeyCode::Char('-') => Ok(tx.send(Event::DecInterval)?),
@@ -365,7 +368,7 @@ fn battery_bar(capacity: u8) -> String {
     set.three_quarters,
     set.seven_eighths,
   ];
-  let eighths = usize::from(capacity.min(100)) * 32 / 100;
+  let eighths = battery_steps(capacity);
   let full = eighths / 8;
   let partial = eighths % 8;
 
@@ -376,6 +379,10 @@ fn battery_bar(capacity: u8) -> String {
     set.empty.repeat(4usize.saturating_sub(full + usize::from(full < 4))),
     if capacity < 100 { "▏" } else { "" }
   )
+}
+
+fn battery_steps(capacity: u8) -> usize {
+  usize::from(capacity.min(100)) * 32 / 100
 }
 
 fn battery_color(status: BatteryStatus, primary: Color) -> Color {
@@ -389,7 +396,7 @@ fn battery_color(status: BatteryStatus, primary: Color) -> Color {
   }
 }
 
-fn battery_label(status: BatteryStatus, primary: Color) -> Line<'static> {
+fn battery_label(status: BatteryStatus, primary: Color, runtime: &str) -> Line<'static> {
   let color = battery_color(status, primary);
   let mut spans = vec![Span::styled(format!(" {}", battery_bar(status.capacity)), color)];
   if status.capacity <= 15 || status.capacity < 100 && status.is_charging {
@@ -398,8 +405,33 @@ fn battery_label(status: BatteryStatus, primary: Color) -> Line<'static> {
   if status.is_charging || status.on_ac_power && status.input_power_mw.is_some() {
     spans.push(Span::styled(" ⚡", color));
   }
+  if !runtime.is_empty() {
+    spans.push(Span::styled(format!(" {runtime}"), primary));
+  }
   spans.push(Span::raw(" "));
   Line::from(spans)
+}
+
+fn battery_runtime_key(status: BatteryStatus) -> Option<(usize, Option<u8>)> {
+  (!status.on_ac_power)
+    .then(|| (battery_steps(status.capacity), (status.capacity <= 15).then_some(status.capacity)))
+}
+
+fn format_runtime(energy_mwh: u64, watts: u64) -> String {
+  let minutes = energy_mwh.saturating_mul(60) / (watts * 1000);
+  if minutes >= 60 {
+    format!("{}h{:02}m", minutes / 60, minutes % 60)
+  } else {
+    format!("{minutes}m")
+  }
+}
+
+fn battery_runtime(energy_mwh: u64) -> String {
+  BATTERY_LOADS_W
+    .iter()
+    .map(|watts| format!("{}@{watts}W", format_runtime(energy_mwh, *watts)))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn power_label(status: Option<BatteryStatus>) -> String {
@@ -431,6 +463,9 @@ pub struct App {
   gpu_temp: TempStore,
   fans: FanStore,
   battery: Option<BatteryStatus>,
+  battery_runtime_key: Option<(usize, Option<u8>)>,
+  battery_runtime: String,
+  show_help: bool,
 
   ecpu_freq: CpuFreqStore,
   pcpu_freq: CpuFreqStore,
@@ -463,6 +498,19 @@ impl App {
     self.fans.push(data.fans);
 
     self.mem.push(data.memory);
+  }
+
+  fn update_battery(&mut self, battery: Option<BatteryStatus>) {
+    let key = battery.and_then(battery_runtime_key);
+    if key != self.battery_runtime_key {
+      self.battery_runtime = battery
+        .filter(|status| !status.on_ac_power)
+        .and_then(|status| status.remaining_energy_mwh)
+        .map(battery_runtime)
+        .unwrap_or_default();
+      self.battery_runtime_key = key;
+    }
+    self.battery = battery;
   }
 
   fn title_block<'a>(&self, label_l: &str, label_r: &str) -> Block<'a> {
@@ -807,14 +855,9 @@ impl App {
 
     let mut block = self.title_block(&label_l, &label_r);
     if let Some(battery) = self.battery {
-      block = block.title_bottom(battery_label(battery, self.cfg.color));
+      block = block.title_bottom(battery_label(battery, self.cfg.color, &self.battery_runtime));
     }
-    let usage = format!(
-      " q quit | c color | v chart | d detail | r {} | -/+ {}ms ",
-      self.cfg.ratio_mode.label(),
-      self.cfg.interval,
-    );
-    let block = block.title_bottom(Line::from(usage).right_aligned());
+    let block = block.title_bottom(Line::from(" ? ").right_aligned());
     let iarea = block.inner(rows[1]);
     f.render_widget(block, rows[1]);
 
@@ -826,6 +869,32 @@ impl App {
     f.render_widget(self.get_power_block("CPU", &self.cpu_power, self.cpu_temp.last()), ha[0]);
     f.render_widget(self.get_power_block("GPU", &self.gpu_power, self.gpu_temp.last()), ha[1]);
     f.render_widget(self.get_power_block("Total", &self.sys_power, 0.0), ha[2]);
+
+    if self.show_help {
+      let help = [
+        "?           toggle help",
+        "q / Ctrl-C  quit",
+        "c           change color",
+        "v           change chart type",
+        "d           toggle detail view",
+        "r           change ratio mode",
+        "+ / =       increase interval",
+        "-           decrease interval",
+      ];
+      let area = f.area();
+      let width = help.iter().map(|line| line.len()).max().unwrap_or(0) as u16 + 2;
+      let popup = Rect::new(
+        area.x + area.width.saturating_sub(width.min(area.width)) / 2,
+        area.y + area.height.saturating_sub((help.len() as u16 + 2).min(area.height)) / 2,
+        width.min(area.width),
+        (help.len() as u16 + 2).min(area.height),
+      );
+      f.render_widget(Clear, popup);
+      f.render_widget(
+        Paragraph::new(help.join("\n")).block(self.title_block("Help", "")).style(self.cfg.color),
+        popup,
+      );
+    }
   }
 
   pub fn run_loop(&mut self, interval: Option<u32>) -> WithError<()> {
@@ -846,12 +915,13 @@ impl App {
         Event::Quit => break,
         Event::Update(data, battery) => {
           self.update_metrics(*data);
-          self.battery = battery;
+          self.update_battery(battery);
         }
         Event::ChangeColor => self.cfg.next_color(),
         Event::ChangeView => self.cfg.next_view_type(),
         Event::TogglePerCore => self.cfg.toggle_per_core_view(),
         Event::ToggleRatioMode => self.cfg.toggle_ratio_mode(),
+        Event::ToggleHelp => self.show_help = !self.show_help,
         Event::IncInterval => {
           self.cfg.inc_interval();
           *msec.write().unwrap() = self.cfg.interval;
@@ -871,12 +941,22 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-  use super::{battery_bar, battery_color, battery_label, power_label};
+  use super::{
+    battery_bar, battery_color, battery_label, battery_runtime, battery_runtime_key,
+    format_runtime, power_label,
+  };
   use macmon::sources::BatteryStatus;
   use ratatui::{style::Color, text::Line};
 
   fn battery(capacity: u8, is_charging: bool, on_ac_power: bool) -> BatteryStatus {
-    BatteryStatus { capacity, is_charging, on_ac_power, adapter_watts: None, input_power_mw: None }
+    BatteryStatus {
+      capacity,
+      is_charging,
+      on_ac_power,
+      adapter_watts: None,
+      input_power_mw: None,
+      remaining_energy_mwh: None,
+    }
   }
 
   #[test]
@@ -903,23 +983,23 @@ mod tests {
     let base = battery(79, false, false);
     let text =
       |line: Line<'_>| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-    assert_eq!(text(battery_label(base, Color::Green)), " ▕███▏▏ ");
-    let charging = battery_label(battery(79, true, true), Color::Blue);
+    assert_eq!(text(battery_label(base, Color::Green, "")), " ▕███▏▏ ");
+    let charging = battery_label(battery(79, true, true), Color::Blue, "");
     assert_eq!(text(charging.clone()), " ▕███▏▏ 79% ⚡ ");
     assert_eq!(charging.spans[0].style.fg, Some(Color::Green));
     assert_eq!(charging.spans[1].style.fg, Some(Color::Blue));
     assert_eq!(charging.spans[2].style.fg, Some(Color::Green));
 
-    let low = battery_label(battery(15, true, false), Color::Green);
+    let low = battery_label(battery(15, true, false), Color::Green, "");
     assert_eq!(text(low.clone()), " ▕▌   ▏ 15% ⚡ ");
     assert_eq!(low.spans[0].style.fg, Some(Color::Red));
     assert_eq!(low.spans[1].style.fg, Some(Color::Green));
-    assert_eq!(text(battery_label(battery(16, false, false), Color::Green)), " ▕▋   ▏ ");
+    assert_eq!(text(battery_label(battery(16, false, false), Color::Green, "")), " ▕▋   ▏ ");
 
     let mut powered = battery(15, false, true);
     powered.input_power_mw = Some(10_000);
-    assert_eq!(text(battery_label(powered, Color::Green)), " ▕▌   ▏ 15% ⚡ ");
-    assert_eq!(text(battery_label(battery(100, true, true), Color::Blue)), " ▕████ ⚡ ");
+    assert_eq!(text(battery_label(powered, Color::Green, "")), " ▕▌   ▏ 15% ⚡ ");
+    assert_eq!(text(battery_label(battery(100, true, true), Color::Blue, "")), " ▕████ ⚡ ");
 
     let mut adapter = battery(50, true, true);
     assert_eq!(power_label(Some(adapter)), "AC connected");
@@ -930,5 +1010,31 @@ mod tests {
     adapter.adapter_watts = None;
     assert_eq!(power_label(Some(adapter)), "AC 46W");
     assert_eq!(power_label(Some(battery(50, false, false))), "");
+  }
+
+  #[test]
+  fn predicts_runtime_at_visible_battery_granularity() {
+    assert_eq!(format_runtime(46_667, 20), "2h20m");
+    assert_eq!(battery_runtime(46_667), "2h20m@20W 56m@50W 28m@99W");
+    assert_eq!(
+      battery_runtime_key(battery(79, false, false)),
+      battery_runtime_key(battery(81, false, false))
+    );
+    assert_ne!(
+      battery_runtime_key(battery(81, false, false)),
+      battery_runtime_key(battery(82, false, false))
+    );
+    assert_ne!(
+      battery_runtime_key(battery(14, false, false)),
+      battery_runtime_key(battery(15, false, false))
+    );
+    assert_eq!(battery_runtime_key(battery(50, false, true)), None);
+
+    let text =
+      |line: Line<'_>| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+    assert_eq!(
+      text(battery_label(battery(79, false, false), Color::Green, "2h20m@20W")),
+      " ▕███▏▏ 2h20m@20W "
+    );
   }
 }

@@ -22,15 +22,6 @@ pub enum RatioMode {
   Active,
 }
 
-impl RatioMode {
-  pub fn label(self) -> &'static str {
-    match self {
-      Self::Scaled => "scaled",
-      Self::Active => "active",
-    }
-  }
-}
-
 #[serde_inline_default]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {

@@ -65,6 +65,8 @@ pub struct BatteryStatus {
   pub adapter_watts: Option<u32>,
   /// Live DC input power in milliwatts, when reported by macOS.
   pub input_power_mw: Option<u32>,
+  /// Approximate remaining battery energy in milliwatt-hours.
+  pub remaining_energy_mwh: Option<u64>,
 }
 
 // MARK: CFUtils
@@ -656,6 +658,12 @@ fn battery_percentage(current: i64, max: i64) -> Option<u8> {
   (current >= 0 && max > 0).then(|| (current.saturating_mul(100) / max).clamp(0, 100) as u8)
 }
 
+fn battery_energy_mwh(capacity_mah: i64, voltage_mv: i64) -> Option<u64> {
+  let capacity_mah = u64::try_from(capacity_mah).ok()?;
+  let voltage_mv = u64::try_from(voltage_mv).ok()?;
+  (capacity_mah > 0 && voltage_mv > 0).then(|| capacity_mah.saturating_mul(voltage_mv) / 1000)
+}
+
 fn is_ac_power() -> bool {
   let snapshot = unsafe { IOPSCopyPowerSourcesInfo() };
   if snapshot.is_null() {
@@ -684,6 +692,11 @@ pub fn get_battery_status() -> Option<BatteryStatus> {
     .and_then(|telemetry| cfnum_get_i64(telemetry.cast(), "SystemPowerIn"))
     .and_then(|milliwatts| u32::try_from(milliwatts).ok())
     .filter(|milliwatts| *milliwatts > 0);
+  let remaining_energy_mwh = cfnum_get_i64(props, "AppleRawCurrentCapacity").and_then(|capacity| {
+    cfnum_get_i64(props, "AppleRawBatteryVoltage")
+      .or_else(|| cfnum_get_i64(props, "Voltage"))
+      .and_then(|voltage| battery_energy_mwh(capacity, voltage))
+  });
   let on_ac_power = is_ac_power();
   unsafe { CFRelease(props as _) }
   capacity.map(|capacity| BatteryStatus {
@@ -692,6 +705,7 @@ pub fn get_battery_status() -> Option<BatteryStatus> {
     on_ac_power,
     adapter_watts,
     input_power_mw,
+    remaining_energy_mwh,
   })
 }
 
@@ -1496,5 +1510,12 @@ mod tests {
     assert_eq!(battery_percentage(9_000, 10_000), Some(90));
     assert_eq!(battery_percentage(110, 100), Some(100));
     assert_eq!(battery_percentage(1, 0), None);
+  }
+
+  #[test]
+  fn calculates_remaining_battery_energy() {
+    assert_eq!(battery_energy_mwh(7307, 12920), Some(94_406));
+    assert_eq!(battery_energy_mwh(0, 12920), None);
+    assert_eq!(battery_energy_mwh(-1, 12920), None);
   }
 }
