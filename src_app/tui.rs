@@ -640,6 +640,8 @@ pub struct App {
   battery_timer: BatteryTimer,
   battery_runtime_key: Option<(usize, Option<u8>)>,
   battery_runtime: String,
+  battery_runtime_current: String,
+  battery_runtime_ticks: u8,
   show_help: bool,
 
   ecpu_freq: CpuFreqStore,
@@ -680,15 +682,24 @@ impl App {
       self.battery_timer.entering_ac(battery).then(configured_charge_limit).flatten();
     self.battery_timer.update(battery, Instant::now(), charge_limit);
 
+    let energy_mwh =
+      battery.filter(|status| !status.on_ac_power).and_then(|status| status.remaining_energy_mwh);
     let key = battery.and_then(battery_runtime_key);
     if key != self.battery_runtime_key {
-      self.battery_runtime = battery
-        .filter(|status| !status.on_ac_power)
-        .and_then(|status| status.remaining_energy_mwh)
-        .map(battery_runtime)
-        .unwrap_or_default();
+      self.battery_runtime = energy_mwh.map(battery_runtime).unwrap_or_default();
       self.battery_runtime_key = key;
     }
+
+    // Recompute on the first sample and every 10 sampling updates.
+    if self.battery_runtime_ticks == 0 || energy_mwh.is_none() {
+      let watts = self.sys_power.top_value.round() as u64;
+      self.battery_runtime_current = energy_mwh
+        .filter(|_| watts > 0 && watts.checked_mul(1000).is_some())
+        .map(|energy| format!("{}@{watts}W", format_runtime(energy, watts)))
+        .unwrap_or_default();
+    }
+    self.battery_runtime_ticks =
+      if energy_mwh.is_some() { (self.battery_runtime_ticks + 1) % 10 } else { 0 };
     self.battery = battery;
   }
 
@@ -1038,7 +1049,8 @@ impl App {
 
     let mut block = self.title_block(&label_l, &label_r);
     if let Some(battery) = self.battery {
-      block = block.title_bottom(battery_label(battery, self.cfg.color, &self.battery_runtime));
+      let runtime = format!("{} {}", self.battery_runtime_current, self.battery_runtime);
+      block = block.title_bottom(battery_label(battery, self.cfg.color, runtime.trim()));
     }
     let block = block.title_bottom(Line::from(" ? ").right_aligned());
     let iarea = block.inner(rows[1]);
@@ -1125,11 +1137,11 @@ impl App {
 #[cfg(test)]
 mod tests {
   use super::{
-    BatteryTimer, battery_bar, battery_color, battery_label, battery_runtime, battery_runtime_key,
-    battery_time_label, format_runtime, parse_charge_limit, power_label,
+    App, BatteryTimer, battery_bar, battery_color, battery_label, battery_runtime,
+    battery_runtime_key, battery_time_label, format_runtime, parse_charge_limit, power_label,
   };
-  use macmon::sources::BatteryStatus;
-  use ratatui::{style::Color, text::Line};
+  use macmon::{Metrics, sources::BatteryStatus};
+  use ratatui::{Terminal, backend::TestBackend, style::Color, text::Line};
   use std::time::Duration;
 
   fn battery(capacity: u8, is_charging: bool, on_ac_power: bool) -> BatteryStatus {
@@ -1221,6 +1233,59 @@ mod tests {
       text(battery_label(battery(79, false, false), Color::Green, "2h20m@20W")),
       " ▕███▏▏ 2h20m@20W "
     );
+  }
+
+  #[test]
+  fn refreshes_current_battery_runtime_every_ten_samples() {
+    let mut app = App::default();
+    let mut status = battery(79, false, false);
+    status.remaining_energy_mwh = Some(46_667);
+    for sys_power in [50.0, 11.0, 13.96] {
+      app.update_metrics(Metrics { sys_power, ..Default::default() });
+    }
+    app.update_battery(Some(status));
+    assert_eq!(app.battery_runtime_current, "3h53m@12W");
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen =
+      term.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+    assert!(screen.contains("▕███▏▏ 3h53m@12W 2h20m@20W 56m@50W 28m@99W"));
+
+    for (interval, sys_power, energy, expected) in
+      [(250, 25.6, 45_000, "1h43m@26W"), (10_000, 19.5, 42_000, "2h06m@20W")]
+    {
+      app.cfg.interval = interval;
+      status.remaining_energy_mwh = Some(energy);
+      let previous = app.battery_runtime_current.clone();
+      for _ in 0..9 {
+        app.update_metrics(Metrics { sys_power, ..Default::default() });
+        app.update_battery(Some(status));
+        assert_eq!(app.battery_runtime_current, previous);
+      }
+      app.update_metrics(Metrics { sys_power, ..Default::default() });
+      app.update_battery(Some(status));
+      assert_eq!(app.battery_runtime_current, expected);
+      assert_eq!(app.battery_runtime, "2h20m@20W 56m@50W 28m@99W");
+    }
+
+    app.update_battery(Some(BatteryStatus { on_ac_power: true, ..status }));
+    assert!(app.battery_runtime_current.is_empty());
+    app.update_battery(Some(status));
+    assert_eq!(app.battery_runtime_current, "2h06m@20W");
+    app.update_battery(None);
+    assert!(app.battery_runtime_current.is_empty());
+    app.update_battery(Some(status));
+    assert_eq!(app.battery_runtime_current, "2h06m@20W");
+    app.update_battery(Some(BatteryStatus { remaining_energy_mwh: None, ..status }));
+    assert!(app.battery_runtime_current.is_empty());
+
+    for watts in [0.0, 0.4, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+      app.update_battery(None);
+      app.sys_power.top_value = watts;
+      app.update_battery(Some(status));
+      assert!(app.battery_runtime_current.is_empty());
+    }
   }
 
   #[test]
